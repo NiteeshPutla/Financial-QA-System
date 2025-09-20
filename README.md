@@ -52,7 +52,7 @@ The system is built with a modular architecture that separates concerns:
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/NiteeshPutla/Financial-QA-System.git
+git clone 
 cd Financial-QA-System
 ```
 

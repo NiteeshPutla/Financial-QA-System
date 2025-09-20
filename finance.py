@@ -2,16 +2,20 @@ import os
 import json
 import re
 import requests
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from bs4 import BeautifulSoup
 import google.generativeai as genai
 from datetime import datetime
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
+from math import log
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 load_dotenv()
 
@@ -114,7 +118,7 @@ class SECFilingDownloader:
         except Exception as e:
             logger.error(f"Error downloading {company} {year}: {e}")
             return None
-    
+        
     def download_all_filings(self) -> Dict[str, Dict[str, str]]:
         """Download all required filings"""
         filings = {}
@@ -141,18 +145,73 @@ class TextProcessor:
             with open(filepath, 'r', encoding='utf-8') as f:
                 html_content = f.read()
             
-            # Remove HTML tags
-            text = re.sub(r'<[^>]+>', ' ', html_content)
-            
-            # Clean up whitespace
-            text = re.sub(r'\s+', ' ', text)
-            text = text.strip()
-            
+            soup = BeautifulSoup(html_content, 'lxml')
+            # Remove scripts/styles
+            for tag in soup(['script', 'style']):
+                tag.decompose()
+            text = soup.get_text(separator=' ')
+            # Clean whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
             return text
             
         except Exception as e:
             logger.error(f"Error extracting text from {filepath}: {e}")
             return ""
+
+    def extract_tables_from_html(self, filepath: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Parse HTML tables into JSON rows; returns (rows, table_titles)."""
+        rows: List[Dict[str, Any]] = []
+        titles: List[str] = []
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            soup = BeautifulSoup(html_content, 'lxml')
+            tables = soup.find_all('table')
+            for t_idx, table in enumerate(tables):
+                # Try to find a title/caption nearby
+                title = None
+                if table.caption and table.caption.get_text(strip=True):
+                    title = table.caption.get_text(strip=True)
+                else:
+                    # Look at preceding sibling text for a likely title
+                    prev = table.find_previous(string=True)
+                    if prev:
+                        cand = prev.strip()
+                        if 3 <= len(cand) <= 200:
+                            title = cand
+                title = title or f"Table {t_idx+1}"
+                titles.append(title)
+                # Extract headers
+                headers: List[str] = []
+                header_row = table.find('tr')
+                if header_row:
+                    ths = header_row.find_all(['th'])
+                    if ths:
+                        headers = [th.get_text(strip=True) or f"col_{i}" for i, th in enumerate(ths)]
+                if not headers:
+                    # Try first row tds as headers
+                    first = table.find('tr')
+                    if first:
+                        tds = first.find_all('td')
+                        headers = [td.get_text(strip=True) or f"col_{i}" for i, td in enumerate(tds)]
+                # Extract data rows
+                trs = table.find_all('tr')
+                for r_idx, tr in enumerate(trs[1:] if len(trs) > 1 else trs):
+                    cells = tr.find_all(['td', 'th'])
+                    values = [c.get_text(separator=' ', strip=True) for c in cells]
+                    if not values:
+                        continue
+                    # Align with headers
+                    row_dict: Dict[str, Any] = {}
+                    for i, val in enumerate(values):
+                        key = headers[i] if i < len(headers) else f"col_{i}"
+                        row_dict[key] = val
+                    row_dict['__table_title'] = title
+                    row_dict['__row_index'] = r_idx
+                    rows.append(row_dict)
+        except Exception as e:
+            logger.error(f"Error extracting tables from {filepath}: {e}")
+        return rows, titles
     
     def chunk_text(self, text: str, company: str, year: str) -> List[DocumentChunk]:
         """Split text into semantic chunks"""
@@ -180,96 +239,160 @@ class TextProcessor:
         return chunks
     
     def process_filing(self, filepath: str, company: str, year: str) -> List[DocumentChunk]:
-        """Process a single filing into chunks"""
+        """Process a single filing into text chunks and table-row chunks"""
+        chunks: List[DocumentChunk] = []
         text = self.extract_text_from_html(filepath)
-        return self.chunk_text(text, company, year)
+        chunks.extend(self.chunk_text(text, company, year))
+        # Tables → JSON → chunks
+        table_rows, _ = self.extract_tables_from_html(filepath)
+        if table_rows:
+            # Persist table JSON for transparency
+            try:
+                out_dir = Path(filepath).parent
+                out_path = out_dir / f"{company}_{year}_tables.json"
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    json.dump(table_rows, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Could not write tables JSON: {e}")
+            for row in table_rows:
+                table_title = row.get('__table_title', '')
+                row_index = int(row.get('__row_index', 0))
+                # Build a readable text representation of the row
+                kv_pairs = []
+                for k, v in row.items():
+                    if k.startswith('__'):
+                        continue
+                    if v:
+                        kv_pairs.append(f"{k}: {v}")
+                row_text = f"TABLE {table_title} | " + " | ".join(kv_pairs)
+                chunks.append(DocumentChunk(
+                    text=row_text,
+                    company=company,
+                    year=year,
+                    page=0,
+                    section=f"table:{table_title}#row{row_index}"
+                ))
+        return chunks
 
 class VectorStore:
-    """Simple in-memory vector store using TF-IDF"""
+    """In-memory vector store using OpenAI embeddings + keyword fallback."""
     
-    def __init__(self):
+    def __init__(self, openai_client: Optional["OpenAI"] = None, embedding_model: str = "text-embedding-3-large"):
         self.chunks: List[DocumentChunk] = []
-        self.vectorizer: Optional[TfidfVectorizer] = None
-        self.vectors: Optional[np.ndarray] = None
+        self._openai = openai_client
+        self._embedding_model = embedding_model
+        self._embeddings: Optional[np.ndarray] = None  # shape: (N, D)
+        # Keyword index
+        self._doc_term_freqs: List[Dict[str, int]] = []
+        self._doc_lengths: List[int] = []
+        self._df: Dict[str, int] = {}
+        self._vocab: set = set()
     
     def add_chunks(self, chunks: List[DocumentChunk]):
-        """Add document chunks to the store"""
         self.chunks.extend(chunks)
         logger.info(f"Added {len(chunks)} chunks. Total: {len(self.chunks)}")
     
+    def _compute_keyword_index(self, texts: List[str]):
+        self._doc_term_freqs.clear()
+        self._doc_lengths.clear()
+        self._df.clear()
+        self._vocab = set()
+        for text in texts:
+            # Simple tokenization: alphanumerics lowered
+            tokens = re.findall(r"[a-zA-Z0-9$%]+", text.lower())
+            term_freq: Dict[str, int] = {}
+            for tok in tokens:
+                term_freq[tok] = term_freq.get(tok, 0) + 1
+            self._doc_term_freqs.append(term_freq)
+            self._doc_lengths.append(len(tokens))
+            for tok in set(term_freq.keys()):
+                self._df[tok] = self._df.get(tok, 0) + 1
+                self._vocab.add(tok)
+    
+    def _embed_texts(self, texts: List[str]) -> np.ndarray:
+        if self._openai is None:
+            raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY.")
+        # OpenAI API returns list of data objects with embedding vectors
+        resp = self._openai.embeddings.create(model=self._embedding_model, input=texts)
+        vectors = [item.embedding for item in resp.data]
+        return np.array(vectors, dtype=np.float32)
+    
     def build_index(self):
-        """Build TF-IDF index for all chunks"""
         if not self.chunks:
             logger.warning("No chunks to index")
             return
-        
-        logger.info("Building TF-IDF index...")
-        
-        # Extract text from all chunks
-        texts = [chunk.text for chunk in self.chunks]
-        
-        # Build TF-IDF vectors
-        self.vectorizer = TfidfVectorizer(
-            max_features=5000,
-            stop_words='english',
-            ngram_range=(1, 2)
-        )
-        
-        self.vectors = self.vectorizer.fit_transform(texts)
-        logger.info(f"Built index with {self.vectors.shape[0]} documents")
+        texts = [c.text for c in self.chunks]
+        logger.info("Building semantic embeddings (OpenAI) and keyword index...")
+        # Keyword index
+        self._compute_keyword_index(texts)
+        # Semantic embeddings
+        try:
+            # Batch in reasonable sizes to avoid token limits
+            batch = 256
+            embs: List[np.ndarray] = []
+            for i in range(0, len(texts), batch):
+                batch_vecs = self._embed_texts(texts[i:i+batch])
+                embs.append(batch_vecs)
+            self._embeddings = np.vstack(embs)
+        except Exception as e:
+            logger.error(f"Error building embeddings: {e}")
+            self._embeddings = None
+        logger.info(f"Index built. Chunks: {len(texts)} | Embeddings: {None if self._embeddings is None else self._embeddings.shape}")
+    
+    def _semantic_scores(self, query: str) -> Optional[np.ndarray]:
+        if self._embeddings is None:
+            return None
+        try:
+            qvec = self._embed_texts([query])[0]
+            # cosine similarity
+            A = self._embeddings
+            denom = (np.linalg.norm(A, axis=1) * np.linalg.norm(qvec) + 1e-12)
+            sims = (A @ qvec) / denom
+            return sims
+        except Exception as e:
+            logger.error(f"Semantic scoring failed: {e}")
+            return None
+    
+    def _keyword_scores(self, query: str) -> np.ndarray:
+        # Simple IDF-weighted sum of term frequencies
+        tokens = re.findall(r"[a-zA-Z0-9$%]+", query.lower())
+        N = max(1, len(self._doc_term_freqs))
+        scores = np.zeros(N, dtype=np.float32)
+        for t in tokens:
+            df = self._df.get(t, 0)
+            if df == 0:
+                continue
+            idf = log((N + 1) / (df + 1)) + 1.0
+            for i, tfmap in enumerate(self._doc_term_freqs):
+                tf = tfmap.get(t, 0)
+                if tf:
+                    scores[i] += tf * idf
+        # Normalize by document length to reduce bias
+        lengths = np.array([max(1, L) for L in self._doc_lengths], dtype=np.float32)
+        scores = scores / lengths
+        return scores
     
     def search(self, query: str, top_k: int = 5, company_filter: str = None) -> List[DocumentChunk]:
-        """Search for relevant chunks"""
-        if self.vectors is None or self.vectorizer is None:
-            logger.error("Index not built. Call build_index() first.")
+        if not self.chunks:
             return []
-        
-        # Vectorize query
-        try:
-            query_vector = self.vectorizer.transform([query])
-        except Exception as e:
-            logger.error(f"Error vectorizing query: {e}")
-            return []
-        
-        # Calculate similarities
-        try:
-            similarities = cosine_similarity(query_vector, self.vectors).flatten()
-        except Exception as e:
-            logger.error(f"Error calculating similarities: {e}")
-            return []
-        
-        # Get top-k indices, ensuring we have valid similarities
-        if similarities.size == 0:
-            logger.warning("No similarities calculated")
-            return []
-            
-        try:
-            top_indices = np.argsort(similarities)[::-1][:top_k * 2]  # Get more for filtering
-        except Exception as e:
-            logger.error(f"Error sorting similarities: {e}")
-            return []
-        
-        # Filter results
-        results = []
-        try:
-            for idx in top_indices:
-                if idx >= len(self.chunks):
-                    continue
-                    
-                chunk = self.chunks[idx]
-                
-                # Apply company filter if specified
-                if company_filter and chunk.company != company_filter:
-                    continue
-                
-                if len(results) >= top_k:
-                    break
-                    
-                results.append(chunk)
-        except Exception as e:
-            logger.error(f"Error filtering results: {e}")
-            return []
-        
+        sem = self._semantic_scores(query)
+        key = self._keyword_scores(query)
+        if sem is None:
+            combined = key
+        else:
+            # Scale to comparable ranges
+            sem_norm = (sem - sem.min()) / (sem.max() - sem.min() + 1e-12)
+            key_norm = (key - key.min()) / (key.max() - key.min() + 1e-12)
+            combined = 0.7 * sem_norm + 0.3 * key_norm
+        indices = np.argsort(combined)[::-1]
+        results: List[DocumentChunk] = []
+        for idx in indices:
+            if len(results) >= top_k:
+                break
+            chunk = self.chunks[idx]
+            if company_filter and chunk.company != company_filter:
+                continue
+            results.append(chunk)
         return results
 
 class FinancialAgent:
@@ -278,6 +401,8 @@ class FinancialAgent:
     def __init__(self, vector_store: VectorStore, llm_client):
         self.vector_store = vector_store
         self.llm = llm_client
+        self.max_iterations = 3
+        self.confidence_threshold = 0.75
     
     def is_complex_query(self, query: str) -> bool:
         """Determine if query needs decomposition"""
@@ -451,78 +576,115 @@ class FinancialAgent:
                 "sources": []
             }
     
-    def answer_complex_query(self, query: str) -> QueryResult:
-        """Answer complex query using decomposition"""
-        # Decompose query
-        sub_queries = self.decompose_query(query)
-        
-        logger.info(f"Decomposed query into: {sub_queries}")
-        
-        # Answer each sub-query
-        sub_results = []
-        all_sources = []
-        
-        for sub_query in sub_queries:
-            # Validate sub-query before processing
-            if not sub_query or not isinstance(sub_query, str):
-                logger.warning(f"Skipping invalid sub-query: {sub_query}")
+    def _plan(self, query: str) -> List[str]:
+        """Plan node: LLM-based decomposition of the task into sub-queries."""
+        return self.decompose_query(query)
+
+    def _act(self, sub_queries: List[str]) -> List[Dict[str, Any]]:
+        """Act node: retrieve/context/answers per sub-query."""
+        results: List[Dict[str, Any]] = []
+        for sq in sub_queries:
+            if not sq or not isinstance(sq, str):
                 continue
-                
-            try:
-                result = self.answer_simple_query(sub_query)
-                sub_results.append({
-                    "query": sub_query,
-                    "answer": result["answer"],
-                    "sources": result["sources"]
-                })
-                all_sources.extend(result["sources"])
-            except Exception as e:
-                logger.error(f"Error processing sub-query '{sub_query}': {e}")
-                sub_results.append({
-                    "query": sub_query,
-                    "answer": f"Error processing query: {e}",
-                    "sources": []
-                })
-        
-        # Synthesize final answer
+            r = self.answer_simple_query(sq)
+            results.append({
+                "query": sq,
+                "answer": r.get("answer", ""),
+                "sources": r.get("sources", [])
+            })
+        return results
+
+    def _reflect(self, original_question: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Reflect node: assess confidence, propose follow-ups. Returns dict with keys
+        {"confidence": float 0..1, "follow_ups": [str], "final_ready": bool}.
+        """
         try:
-            synthesis_context = "\n\n".join([
-                f"Q: {r['query']}\nA: {r['answer']}" for r in sub_results
-            ])
-            
-            synthesis_prompt = f"""
-            Based on the following sub-query results, provide a comprehensive answer to the original question.
-            Synthesize the information and provide specific comparisons, calculations, or insights as needed.
-            
-            Original Question: {query}
-            
-            Sub-query Results:
-            {synthesis_context}
-            
-            Final Answer:
+            prompt = f"""
+            You are verifying an answer synthesis process for a financial Q&A agent.
+            Given the original question and sub-query answers (with sources), evaluate:
+            - Is the evidence sufficient to confidently answer? Return a confidence in [0,1].
+            - If missing numbers or comparisons, propose targeted FOLLOW-UP sub-queries.
+            Return ONLY valid JSON of the form:
+            {{"confidence": <float 0..1>, "follow_ups": [<strings>], "final_ready": <true|false>}}.
+
+            Original Question: {original_question}
+            Sub-query Answers:\n{json.dumps(results, indent=2)}
             """
-            
             response = self.llm.generate_content(
-                synthesis_prompt,
+                prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=500,
+                    max_output_tokens=250,
                     temperature=0
                 )
             )
-            
+            raw = response.text.strip().replace('```json', '').replace('```', '').strip()
+            data = json.loads(raw)
+            conf = float(max(0.0, min(1.0, data.get("confidence", 0.0))))
+            follow = data.get("follow_ups", [])
+            if not isinstance(follow, list):
+                follow = []
+            follow = [s for s in follow if isinstance(s, str)]
+            final_ready = bool(data.get("final_ready", False))
+            return {"confidence": conf, "follow_ups": follow, "final_ready": final_ready}
+        except Exception:
+            return {"confidence": 0.0, "follow_ups": [], "final_ready": False}
+
+    def answer_complex_query(self, query: str) -> QueryResult:
+        """Answer complex query using a Plan→Act→Reflect loop."""
+        all_sources: List[Dict[str, Any]] = []
+        seen_queries: set = set()
+        aggregate_results: List[Dict[str, Any]] = []
+
+        # Iterative loop
+        planned = self._plan(query)
+        for iteration in range(self.max_iterations):
+            # Deduplicate planned sub-queries
+            to_run = [sq for sq in planned if isinstance(sq, str) and sq not in seen_queries]
+            seen_queries.update(to_run)
+            if not to_run and iteration > 0:
+                break
+            # Act
+            new_results = self._act(to_run)
+            for r in new_results:
+                aggregate_results.append(r)
+                all_sources.extend(r.get("sources", []))
+            # Reflect
+            reflect_out = self._reflect(query, aggregate_results)
+            if reflect_out.get("final_ready") or reflect_out.get("confidence", 0.0) >= self.confidence_threshold:
+                break
+            planned = reflect_out.get("follow_ups", [])
+
+        # Synthesis
+        try:
+            synthesis_context = "\n\n".join([f"Q: {r['query']}\nA: {r['answer']}" for r in aggregate_results])
+            synthesis_prompt = f"""
+            Provide a final answer to the original question using the sub-query results. Where appropriate, compute
+            growth rates, margins, and make cross-company comparisons. Be explicit and concise, and include figures
+            with company and year labels. Ensure every numeric claim is supported by the sub-results.
+
+            Original Question: {query}
+            Sub-query Results:
+            {synthesis_context}
+
+            Final Answer:
+            """
+            response = self.llm.generate_content(
+                synthesis_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=700,
+                    temperature=0
+                )
+            )
             final_answer = response.text.strip()
-            
-        except Exception as e:
-            logger.error(f"Error synthesizing answer with LLM: {e}")
-            # Fallback synthesis
-            final_answer = self._fallback_synthesize_answer(query, sub_results)
-        
+        except Exception:
+            final_answer = self._fallback_synthesize_answer(query, aggregate_results)
+
         return QueryResult(
             query=query,
             answer=final_answer,
-            reasoning=f"Decomposed into {len(sub_queries)} sub-queries and synthesized results",
-            sub_queries=sub_queries,
-            sources=all_sources[:10]  # Limit sources
+            reasoning=f"Plan→Act→Reflect over {len(seen_queries)} sub-queries in ≤{self.max_iterations} iterations",
+            sub_queries=[r['query'] for r in aggregate_results],
+            sources=all_sources[:10]
         )
     
     def _fallback_synthesize_answer(self, query: str, sub_results: List[Dict]) -> str:
@@ -572,19 +734,9 @@ class FinancialAgent:
             )
         
         try:
-            if self.is_complex_query(query):
-                logger.info("Complex query detected, using decomposition")
-                return self.answer_complex_query(query)
-            else:
-                logger.info("Simple query, using direct retrieval")
-                result = self.answer_simple_query(query)
-                return QueryResult(
-                    query=query,
-                    answer=result["answer"],
-                    reasoning="Direct retrieval and synthesis",
-                    sub_queries=[query],
-                    sources=result["sources"]
-                )
+            # Always use LLM-driven decomposition + synthesis for consistent reasoning
+            logger.info("Routing all queries through agentic decomposition + synthesis")
+            return self.answer_complex_query(query)
         except Exception as e:
             logger.error(f"Error in answer_query: {e}")
             return QueryResult(
@@ -598,15 +750,21 @@ class FinancialAgent:
 class FinancialRAGSystem:
     """Main RAG system orchestrator"""
     
-    def __init__(self, gemini_api_key: str):
+    def __init__(self, gemini_api_key: str, openai_api_key: Optional[str] = None):
         self.downloader = SECFilingDownloader()
         self.processor = TextProcessor()
-        self.vector_store = VectorStore()
-        
-        # Initialize Gemini client
+        # Init OpenAI client for embeddings
+        self._openai_client = None
+        if openai_api_key and OpenAI is not None:
+            try:
+                os.environ['OPENAI_API_KEY'] = openai_api_key
+                self._openai_client = OpenAI()
+            except Exception as e:
+                logger.warning(f"Failed to init OpenAI client: {e}")
+        self.vector_store = VectorStore(openai_client=self._openai_client)
+        # Initialize Gemini client for reasoning
         genai.configure(api_key=gemini_api_key)
         self.llm = genai.GenerativeModel('gemini-1.5-flash')
-        
         self.agent = FinancialAgent(self.vector_store, self.llm)
     
     def setup(self):
@@ -641,9 +799,10 @@ def main():
     if not api_key:
         print("Error: Please set GEMINI_API_KEY environment variable")
         return
+    openai_key = os.getenv('OPENAI_API_KEY')
     
     # Initialize system
-    rag_system = FinancialRAGSystem(api_key)
+    rag_system = FinancialRAGSystem(api_key, openai_api_key=openai_key)
     
     # Setup (download and index documents)
     rag_system.setup()
@@ -651,8 +810,8 @@ def main():
     # Test queries
     test_queries = [
         "What was NVIDIA's total revenue in fiscal year 2024?",
-        "What percentage of Google's 2023 revenue came from advertising?",
-        "How much did Microsoft's cloud revenue grow from 2022 to 2023?",
+        # "What percentage of Google's 2023 revenue came from advertising?",
+        # "How much did Microsoft's cloud revenue grow from 2022 to 2023?",
         "Which of the three companies had the highest gross margin in 2023?",
         "Compare the R&D spending as a percentage of revenue across all three companies in 2023",
     ]

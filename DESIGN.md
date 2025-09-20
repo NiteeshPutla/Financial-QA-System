@@ -9,13 +9,13 @@
 
 ## Embedding Model Choice
 
-**Model**: TF-IDF (Term Frequency-Inverse Document Frequency)
-- **Why**: 
-  - Simple and effective for financial text with specific terminology
-  - No external API dependencies or model downloads
-  - Fast computation and good performance on domain-specific vocabulary
-  - Works well with the structured nature of 10-K filings
-- **Alternative Considered**: OpenAI embeddings, but TF-IDF was chosen for simplicity and self-contained operation
+**Model**: OpenAI `text-embedding-3-large` for semantic retrieval + keyword fallback
+- **Why**:
+  - Strong semantic recall for finance phrases beyond exact terms
+  - Robust across tables and narrative sections
+  - Combined with lightweight keyword scoring for precision on exact metrics
+- **Fusion**: 70% semantic cosine similarity + 30% IDF-weighted keyword score
+- **Note**: Requires `OPENAI_API_KEY`; if missing, only keyword scoring runs
 
 ## Agent/Query Decomposition Approach
 
@@ -65,14 +65,14 @@ Synthesis: "Microsoft spent $27.2B (13.1% of revenue), Google spent $39.5B (11.8
 - Easy to test and modify individual components
 
 ### In-Memory Vector Store
-- **Pros**: Simple, fast, no external dependencies
-- **Cons**: Limited scalability, data lost on restart
-- **Decision**: Appropriate for this scope and demonstrates core RAG concepts
+- **Pros**: Simple, fast, minimal dependencies; embeds once at startup
+- **Cons**: Limited scalability, no persistence
+- **Decision**: Appropriate for this scope; could migrate to FAISS/Chroma later
 
-### HTML Parsing
-- **Choice**: BeautifulSoup for HTML parsing
-- **Rationale**: Robust parsing of SEC HTML filings, handles malformed HTML well
-- **Alternative**: Could use more sophisticated parsers, but BeautifulSoup is sufficient
+### HTML & Table Parsing
+- **Choice**: BeautifulSoup for HTML parsing and table extraction
+- **Tables → JSON**: Each `<table>` is parsed to JSON rows and written to `data/{COMPANY}_{YEAR}_tables.json`
+- **Embedding Tables**: Each row is converted to readable text like `TABLE {title} | col: value | ...` and embedded with metadata `section="table:{title}#row{n}`
 
 ## Performance Considerations
 
@@ -83,8 +83,8 @@ Synthesis: "Microsoft spent $27.2B (13.1% of revenue), Google spent $39.5B (11.8
 
 ## Future Improvements
 
-1. **Better Embeddings**: Could upgrade to sentence transformers or OpenAI embeddings
-2. **Persistent Vector Store**: Could add ChromaDB or FAISS for production use
-3. **Table Parsing**: Could add financial table extraction for more precise metrics
-4. **Query Optimization**: Could add query expansion and synonym handling
-5. **Caching**: Could add result caching for repeated queries
+1. **Persistent Vector Store**: Add FAISS/Chroma for disk-backed indices
+2. **Section-aware Chunking**: Preserve MD&A, Item 8 boundaries as metadata
+3. **Metric Extractors**: Regex/NER to normalize numeric values and units
+4. **Tool-using Agent**: Add calculator tool; ensure verified numeric ops
+5. **Caching**: Cache per-subquery results to speed repeated runs
